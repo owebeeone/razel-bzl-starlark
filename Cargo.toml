@@ -8,9 +8,16 @@ description = "razelv4 BzlEvaluator impl over starlark-rust (role: impl)."
 razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
 # External (non-razel) deps — the wall governs only intra-workspace razel-* edges, not crates.io deps.
 starlark = "0.14"
-anyhow = "1"   # builtin functions surface errors as `anyhow::Result` (the starlark builtin convention)
+anyhow = "1"        # builtin functions surface errors as `anyhow::Result` (the starlark builtin convention)
+allocative = "0.3"  # required derive for custom Starlark values (rule()/attr markers)
 
 [features]
 # RED-FIRST: drop the duplicate-target-name guard in the `target()` builtin → the dup-name conformance test
 # (a package keyed by name rejects duplicates) must go red.
 mutant_package_allow_dup_names = []
+# RED-FIRST: a rule-instantiated target drops its rule origin → the analysis link is lost (origin conformance red).
+mutant_rule_drops_origin = []
+# RED-FIRST: skip attr-schema validation in a rule call → an unknown attribute is silently accepted (red).
+mutant_rule_skips_attr_validation = []
+# RED-FIRST: skip attr value-TYPE validation → a wrong-typed attr value is silently accepted (red).
+mutant_rule_skips_type_validation = []
