@@ -6,5 +6,11 @@ description = "razelv4 BzlEvaluator impl over starlark-rust (role: impl)."
 
 [dependencies]
 razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
-# External (non-razel) dep — the wall governs only intra-workspace razel-* edges, not crates.io deps.
+# External (non-razel) deps — the wall governs only intra-workspace razel-* edges, not crates.io deps.
 starlark = "0.14"
+anyhow = "1"   # builtin functions surface errors as `anyhow::Result` (the starlark builtin convention)
+
+[features]
+# RED-FIRST: drop the duplicate-target-name guard in the `target()` builtin → the dup-name conformance test
+# (a package keyed by name rejects duplicates) must go red.
+mutant_package_allow_dup_names = []
