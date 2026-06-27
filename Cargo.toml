@@ -1,0 +1,10 @@
+[package]
+name = "razel-bzl-starlark"
+version = "0.1.0"
+edition = "2021"
+description = "razelv4 BzlEvaluator impl over starlark-rust (role: impl)."
+
+[dependencies]
+razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
+# External (non-razel) dep — the wall governs only intra-workspace razel-* edges, not crates.io deps.
+starlark = "0.14"
