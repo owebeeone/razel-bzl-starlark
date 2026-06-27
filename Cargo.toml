@@ -27,3 +27,5 @@ mutant_rule_eval_drops_deps = []
 mutant_provider_skips_field_validation = []
 # RED-FIRST: absorb a missing dep label as an empty provider set → a declared dep silently goes unanalyzed (red).
 mutant_rule_eval_absorbs_missing_dep = []
+# RED-FIRST: drop a rule's declared actions → they never reach execution (action-declaration test red).
+mutant_rule_eval_drops_actions = []

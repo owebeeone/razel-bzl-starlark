@@ -17,8 +17,8 @@
 
 use allocative::Allocative;
 use razel_bzl_api::{
-    AttrType, BzlError, BzlEvaluator, BzlModule, BzlValue, DepProviders, ProviderId, ProviderInstance, ResolvedToolchain,
-    RuleDef, RuleOrigin, RuleResult, TargetDecl,
+    ActionTemplate, AttrType, BzlError, BzlEvaluator, BzlModule, BzlValue, DepProviders, ProviderId, ProviderInstance,
+    ResolvedToolchain, RuleDef, RuleOrigin, RuleResult, TargetDecl,
 };
 use starlark::collections::StarlarkHasher;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
@@ -394,8 +394,53 @@ fn bzl_globals() -> Globals {
     GlobalsBuilder::standard()
         .with(rule_global)
         .with(provider_global)
+        .with(action_global)
         .with_namespace("attr", attr_namespace)
         .build()
+}
+
+/// Accumulates the actions a rule's impl declares (via `declare_action`). Installed in `eval.extra` during
+/// `evaluate_rule` so the builtin (a `fn`, can't capture) records into it; collected into the `RuleResult`.
+#[derive(Default, ProvidesStaticType)]
+struct ActionRegistry {
+    actions: RefCell<Vec<ActionTemplate>>,
+}
+
+#[starlark_module]
+fn action_global(builder: &mut GlobalsBuilder) {
+    /// `declare_action(mnemonic=, argv=[...], outputs=[...], inputs=[...])` — a rule impl declares an action the
+    /// EXECUTION phase will run. SPIKE: a placeholder for `ctx.actions.run(...)` (the object-method form is a
+    /// fidelity refinement); records an `ActionTemplate`. Fail-closed: callable only inside a rule impl.
+    fn declare_action<'v>(
+        #[starlark(require = named)] mnemonic: String,
+        #[starlark(require = named)] argv: Value<'v>,
+        #[starlark(require = named)] outputs: Value<'v>,
+        #[starlark(require = named)] inputs: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let reg = eval
+            .extra
+            .and_then(|e| e.downcast_ref::<ActionRegistry>())
+            .ok_or_else(|| anyhow::anyhow!("declare_action can only be called inside a rule implementation"))?;
+        let str_list = |v: Value<'v>, what: &str| -> anyhow::Result<Vec<String>> {
+            let l = ListRef::from_value(v).ok_or_else(|| anyhow::anyhow!("{what} must be a list of strings"))?;
+            l.iter()
+                .map(|i| i.unpack_str().map(|s| s.to_owned()).ok_or_else(|| anyhow::anyhow!("{what} entries must be strings")))
+                .collect()
+        };
+        let argv = str_list(argv, "argv")?;
+        let mut outputs = str_list(outputs, "outputs")?;
+        outputs.sort();
+        outputs.dedup();
+        let mut inputs = match inputs {
+            Some(v) => str_list(v, "inputs")?,
+            None => Vec::new(),
+        };
+        inputs.sort();
+        inputs.dedup();
+        reg.actions.borrow_mut().push(ActionTemplate { mnemonic, argv, env: Vec::new(), inputs, outputs });
+        Ok(NoneType)
+    }
 }
 
 #[starlark_module]
@@ -642,9 +687,11 @@ impl BzlEvaluator for StarlarkEvaluator {
         let map: HashMap<&str, &FrozenModule> = frozen.iter().map(|(t, fm)| (t.as_str(), fm)).collect();
         let loader = ReturnFileLoader { modules: &map };
 
+        let action_registry = ActionRegistry::default();
         Module::with_temp_heap(|module| -> Result<RuleResult, BzlError> {
             let mut eval = Evaluator::new(&module);
             eval.set_loader(&loader);
+            eval.extra = Some(&action_registry); // declare_action (during the impl run below) records into this
             // Define the rule, its impl, and any providers (the impl is NOT run yet — it's just a function).
             eval.eval_module(ast, &globals).map_err(|e| BzlError::Eval { detail: e.to_string() })?;
 
@@ -752,7 +799,13 @@ impl BzlEvaluator for StarlarkEvaluator {
             // Canonical order (providers are a by-type set) so the node value is deterministic → A4 early cutoff.
             out.sort_by(|a, b| a.provider.0.cmp(&b.provider.0));
             // actions stay empty until phase #5 wires ctx.actions; the RuleResult shape is reserved now.
-            Ok(RuleResult { providers: out, actions: Vec::new() })
+            // MUTANT: drop the declared actions → they never reach the execution phase (emission test red).
+            let actions = if cfg!(feature = "mutant_rule_eval_drops_actions") {
+                Vec::new()
+            } else {
+                action_registry.actions.borrow().clone()
+            };
+            Ok(RuleResult { providers: out, actions })
         })
     }
 }
@@ -794,5 +847,6 @@ mod tests {
         conformance::rule_eval_missing_provider_is_fail_closed(&StarlarkEvaluator::new());
         conformance::provider_rejects_unknown_field(&StarlarkEvaluator::new());
         conformance::rule_eval_missing_dep_label_is_fail_closed(&StarlarkEvaluator::new());
+        conformance::supports_action_declaration(&StarlarkEvaluator::new());
     }
 }
