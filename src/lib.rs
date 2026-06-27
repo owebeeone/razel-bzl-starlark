@@ -17,8 +17,8 @@
 
 use allocative::Allocative;
 use razel_bzl_api::{
-    AttrType, BzlError, BzlEvaluator, BzlModule, BzlValue, DepProviders, ProviderId, ProviderInstance, RuleDef,
-    RuleOrigin, TargetDecl,
+    AttrType, BzlError, BzlEvaluator, BzlModule, BzlValue, DepProviders, ProviderId, ProviderInstance, ResolvedToolchain,
+    RuleDef, RuleOrigin, RuleResult, TargetDecl,
 };
 use starlark::collections::StarlarkHasher;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
@@ -599,7 +599,8 @@ impl BzlEvaluator for StarlarkEvaluator {
         label: &str,
         attrs: &[(String, BzlValue)],
         deps: &[DepProviders],
-    ) -> Result<Vec<ProviderInstance>, BzlError> {
+        toolchains: &[ResolvedToolchain],
+    ) -> Result<RuleResult, BzlError> {
         let ast = parse(rule_module_name, rule_source)?;
         let globals = bzl_globals(); // standard + rule + provider + attr
 
@@ -610,7 +611,7 @@ impl BzlEvaluator for StarlarkEvaluator {
         let map: HashMap<&str, &FrozenModule> = frozen.iter().map(|(t, fm)| (t.as_str(), fm)).collect();
         let loader = ReturnFileLoader { modules: &map };
 
-        Module::with_temp_heap(|module| -> Result<Vec<ProviderInstance>, BzlError> {
+        Module::with_temp_heap(|module| -> Result<RuleResult, BzlError> {
             let mut eval = Evaluator::new(&module);
             eval.set_loader(&loader);
             // Define the rule, its impl, and any providers (the impl is NOT run yet — it's just a function).
@@ -688,7 +689,18 @@ impl BzlEvaluator for StarlarkEvaluator {
                 }
             }
             let attr_struct = heap.alloc(AllocStruct(attr_fields));
-            let ctx = heap.alloc(AllocStruct([("label".to_string(), heap.alloc(label)), ("attr".to_string(), attr_struct)]));
+            // ctx.toolchains: a map {toolchain_type -> toolchain_info} (empty until phase #4 supplies resolved
+            // toolchains). A missing type indexes to a fail-closed error (native dict KeyError).
+            let tc_entries: Vec<(Value, Value)> = toolchains
+                .iter()
+                .map(|t| (heap.alloc(t.toolchain_type.as_str()), alloc_provider_instance(&module, &t.info)))
+                .collect();
+            let toolchains_dict = heap.alloc(AllocDict(tc_entries));
+            let ctx = heap.alloc(AllocStruct([
+                ("label".to_string(), heap.alloc(label)),
+                ("attr".to_string(), attr_struct),
+                ("toolchains".to_string(), toolchains_dict),
+            ]));
 
             // Run the impl, then project the returned provider instances to codec-neutral data.
             let result = eval
@@ -708,7 +720,8 @@ impl BzlEvaluator for StarlarkEvaluator {
             }
             // Canonical order (providers are a by-type set) so the node value is deterministic → A4 early cutoff.
             out.sort_by(|a, b| a.provider.0.cmp(&b.provider.0));
-            Ok(out)
+            // actions stay empty until phase #5 wires ctx.actions; the RuleResult shape is reserved now.
+            Ok(RuleResult { providers: out, actions: Vec::new() })
         })
     }
 }
