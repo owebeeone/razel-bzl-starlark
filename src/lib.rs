@@ -107,14 +107,19 @@ impl<'v> StarlarkValue<'v> for AttrTypeValue {}
 struct RuleValueGen<V: ValueLifetimeless> {
     implementation: V,
     attrs: Vec<(String, u8)>,
+    toolchains: Vec<String>,
 }
 starlark_complex_value!(RuleValue);
 // Manual Freeze (not derived): the `u8` attr-code does not implement starlark's `Freeze`; only the impl
-// function needs freezing, the schema is moved as-is.
+// function needs freezing, the schema + required toolchain types are moved as-is.
 impl<'v> Freeze for RuleValueGen<Value<'v>> {
     type Frozen = RuleValueGen<starlark::values::FrozenValue>;
     fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
-        Ok(RuleValueGen { implementation: self.implementation.freeze(freezer)?, attrs: self.attrs })
+        Ok(RuleValueGen {
+            implementation: self.implementation.freeze(freezer)?,
+            attrs: self.attrs,
+            toolchains: self.toolchains,
+        })
     }
 }
 impl<V: ValueLifetimeless> fmt::Display for RuleValueGen<V> {
@@ -204,6 +209,7 @@ struct RuleProxy {
     kind: String,
     bzl: String,
     attrs: Vec<(String, u8)>,
+    toolchains: Vec<String>,
 }
 starlark_simple_value!(RuleProxy);
 impl fmt::Display for RuleProxy {
@@ -304,10 +310,20 @@ fn convert(v: Value) -> Result<BzlValue, BzlError> {
     // A rule definition (def-side) or a loaded rule (call-side) projects to BzlValue::Rule. The def-side has
     // no identity yet (the export loop stamps name + bzl); the call-side already carries its origin.
     if let Some(rv) = RuleValue::from_value(v) {
-        return Ok(BzlValue::Rule(RuleDef { bzl: String::new(), name: String::new(), attrs: decode_schema(&rv.attrs)? }));
+        return Ok(BzlValue::Rule(RuleDef {
+            bzl: String::new(),
+            name: String::new(),
+            attrs: decode_schema(&rv.attrs)?,
+            toolchains: rv.toolchains.clone(),
+        }));
     }
     if let Some(rp) = v.downcast_ref::<RuleProxy>() {
-        return Ok(BzlValue::Rule(RuleDef { bzl: rp.bzl.clone(), name: rp.kind.clone(), attrs: decode_schema(&rp.attrs)? }));
+        return Ok(BzlValue::Rule(RuleDef {
+            bzl: rp.bzl.clone(),
+            name: rp.kind.clone(),
+            attrs: decode_schema(&rp.attrs)?,
+            toolchains: rp.toolchains.clone(),
+        }));
     }
     if let Some(p) = v.downcast_ref::<Provider>() {
         return Ok(BzlValue::Provider(razel_bzl_api::ProviderDef { id: p.id.clone(), fields: p.fields.clone() }));
@@ -344,6 +360,7 @@ fn alloc<'v>(module: &Module<'v>, v: &BzlValue) -> Value<'v> {
             kind: rd.name.clone(),
             bzl: rd.bzl.clone(),
             attrs: rd.attrs.iter().map(|(n, t)| (n.clone(), t.code())).collect(),
+            toolchains: rd.toolchains.clone(),
         }),
         // A provider re-materializes as a callable Provider (constructs instances; keys dep[Provider] lookups).
         BzlValue::Provider(pd) => heap.alloc(Provider { id: pd.id.clone(), fields: pd.fields.clone() }),
@@ -383,11 +400,13 @@ fn bzl_globals() -> Globals {
 
 #[starlark_module]
 fn rule_global(builder: &mut GlobalsBuilder) {
-    /// `rule(implementation = <fn>, attrs = {name: attr.<type>()})` — define a rule. A1 records the attr
-    /// schema and validates an implementation is present; running the impl is analysis (ADR-0004).
+    /// `rule(implementation = <fn>, attrs = {name: attr.<type>()}, toolchains = ["//type"])` — define a rule.
+    /// Records the attr schema + the required toolchain TYPE ids; validates an implementation is present.
+    /// Running the impl (+ resolving the toolchains) is analysis.
     fn rule<'v>(
         #[starlark(require = named)] implementation: Value<'v>,
         #[starlark(require = named)] attrs: Option<DictRef<'v>>,
+        #[starlark(require = named)] toolchains: Option<Value<'v>>,
     ) -> anyhow::Result<RuleValue<'v>> {
         if implementation.is_none() {
             return Err(anyhow::anyhow!("rule() requires an 'implementation' function"));
@@ -406,7 +425,19 @@ fn rule_global(builder: &mut GlobalsBuilder) {
             }
         }
         schema.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(RuleValueGen { implementation, attrs: schema })
+        let mut required: Vec<String> = match toolchains {
+            None => Vec::new(),
+            Some(v) => {
+                let list = ListRef::from_value(v)
+                    .ok_or_else(|| anyhow::anyhow!("rule() toolchains must be a list of type strings"))?;
+                list.iter()
+                    .map(|i| i.unpack_str().map(|s| s.to_owned()).ok_or_else(|| anyhow::anyhow!("toolchain type must be a string")))
+                    .collect::<anyhow::Result<Vec<String>>>()?
+            }
+        };
+        required.sort();
+        required.dedup();
+        Ok(RuleValueGen { implementation, attrs: schema, toolchains: required })
     }
 }
 
