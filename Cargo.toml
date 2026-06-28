@@ -3,6 +3,7 @@ name = "razel-bzl-starlark"
 version = "0.1.0"
 edition = "2021"
 description = "razelv4 BzlEvaluator impl over starlark-rust (role: impl)."
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 razel-bzl-api = { path = "../razel-bzl-api", version = "0.1.0" }
