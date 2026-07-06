@@ -11,7 +11,7 @@
 //! `attr`/`declare_action`, and the `.bzl` env does not contain `target`. The `eval.extra` registry
 //! fail-closes stay as belt-and-braces, no longer the only wall.
 
-use crate::{action_global, attr_namespace, build_globals, provider_global, rule_global};
+use crate::globals::{action_global, attr_namespace, build_globals, provider_global, rule_global};
 use razel_bzl_api::{derive_predeclared_env_id, EnvEntry, EnvTag, PredeclaredEnvId};
 use starlark::environment::{Globals, GlobalsBuilder};
 use starlark::syntax::Dialect;
