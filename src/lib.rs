@@ -17,11 +17,12 @@
 
 use allocative::Allocative;
 use razel_bzl_api::{
-    ActionTemplate, AttrType, BzlError, BzlEvaluator, BzlModule, BzlValue, DepProviders, ProviderId, ProviderInstance,
-    ResolvedToolchain, RuleDef, RuleOrigin, RuleResult, TargetDecl,
+    ActionTemplate, AttrType, BzlError, BzlEvaluator, BzlModule, BzlValue, DepProviders, Dialect as ApiDialect,
+    EvalEnv, LoadKind, PredeclaredEnvId, ProviderId, ProviderInstance, ResolvedToolchain, RuleDef, RuleOrigin,
+    RuleResult, StarlarkSemanticsId, TargetDecl, TypeOptions,
 };
 use starlark::collections::StarlarkHasher;
-use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
+use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, ReturnFileLoader};
 use starlark::starlark_complex_value;
 use starlark::starlark_module;
@@ -38,7 +39,10 @@ use starlark::values::{
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::Hasher as _;
+
+/// The named, precomputed, digested per-phase environments (lockdown §3).
+mod envs;
+use envs::{env_build_bzl, env_build_file, PhaseEnv};
 
 pub struct StarlarkEvaluator;
 
@@ -53,9 +57,39 @@ impl Default for StarlarkEvaluator {
     }
 }
 
-fn parse(name: &str, source: &str) -> Result<AstModule, BzlError> {
-    AstModule::parse(name, source.to_owned(), &Dialect::Standard)
-        .map_err(|e| BzlError::Parse { detail: e.to_string() })
+fn parse(name: &str, source: &str, dialect: &Dialect) -> Result<AstModule, BzlError> {
+    AstModule::parse(name, source.to_owned(), dialect).map_err(|e| BzlError::Parse { detail: e.to_string() })
+}
+
+/// Select the named phase env an [`EvalEnv`] requests — the kind→env mapping of §1 (key fact A), applied
+/// FAIL-CLOSED over what v1 has built: only `(Build{is_prelude:false}, Bzl)` under the single v1 semantics
+/// row + v1 TypeOptions sentinel evaluates; every other row is a typed error, never a shared default env.
+fn select_bzl_env(env: &EvalEnv) -> Result<&'static PhaseEnv, BzlError> {
+    if env.semantics != StarlarkSemanticsId::v1() {
+        return Err(BzlError::Unsupported {
+            what: "starlark semantics row (v1 registers the single default row — keyed selection with one entry)"
+                .to_owned(),
+        });
+    }
+    if env.type_options != TypeOptions::default() {
+        return Err(BzlError::Unsupported {
+            what: "non-default TypeOptions (the load-time type-check pass is not built in v1)".to_owned(),
+        });
+    }
+    match (env.load_kind, env.dialect) {
+        (LoadKind::Build { is_prelude: false }, ApiDialect::Bzl) => Ok(env_build_bzl()),
+        (LoadKind::Build { is_prelude: true }, _) => Err(BzlError::Unsupported {
+            what: "BUILD prelude evaluation (prelude re-export is not built in v1)".to_owned(),
+        }),
+        (_, ApiDialect::Scl) => Err(BzlError::Unsupported {
+            what: "the .scl environment (EnvScl is not built in v1; .scl is semantics-disabled)".to_owned(),
+        }),
+        (LoadKind::Builtins, _) | (LoadKind::Bzlmod, _) | (LoadKind::BzlmodBootstrap, _) => {
+            Err(BzlError::Unsupported {
+                what: format!("the predeclared environment for {:?} (not built in v1)", env.load_kind),
+            })
+        }
+    }
 }
 
 fn starlark_err(msg: String) -> starlark::Error {
@@ -139,6 +173,14 @@ struct Provider {
     fields: Vec<String>,
 }
 starlark_simple_value!(Provider);
+impl Provider {
+    /// This declaration's identity on the ONE funnel: the declared name with `bzl = None` (the v1 sentinel —
+    /// the declared name IS the exported name under the single-module cap, lockdown R5). ALL live-value
+    /// hashing/equality/keying goes through this + `ProviderId`'s derived impls, never the raw string.
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::from_name(self.id.clone())
+    }
+}
 impl fmt::Display for Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<provider {}>", self.id)
@@ -167,11 +209,14 @@ impl<'v> StarlarkValue<'v> for Provider {
         Ok(eval.heap().alloc(ProviderInstanceValueGen { provider_id: self.id.clone(), fields }))
     }
     fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
-        hasher.write(self.id.as_bytes());
+        // Identity hash via ProviderId's derived Hash (the C2 funnel) — never the raw name bytes.
+        use std::hash::Hash as _;
+        self.provider_id().hash(hasher);
         Ok(())
     }
     fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
-        Ok(Provider::from_value(other).is_some_and(|o| o.id == self.id))
+        // Identity equality via ProviderId's derived Eq (the C2 funnel) — never a raw name comparison.
+        Ok(Provider::from_value(other).is_some_and(|o| o.provider_id() == self.provider_id()))
     }
 }
 
@@ -326,7 +371,7 @@ fn convert(v: Value) -> Result<BzlValue, BzlError> {
         }));
     }
     if let Some(p) = v.downcast_ref::<Provider>() {
-        return Ok(BzlValue::Provider(razel_bzl_api::ProviderDef { id: p.id.clone(), fields: p.fields.clone() }));
+        return Ok(BzlValue::Provider(razel_bzl_api::ProviderDef { id: p.provider_id(), fields: p.fields.clone() }));
     }
     Err(BzlError::Unsupported { what: v.get_type().to_owned() })
 }
@@ -343,16 +388,17 @@ fn decode_schema(coded: &[(String, u8)]) -> Result<Vec<(String, AttrType)>, BzlE
         .collect()
 }
 
-/// Allocate a codec-neutral value into a module's heap (inverse of `convert`).
-fn alloc<'v>(module: &Module<'v>, v: &BzlValue) -> Value<'v> {
+/// Allocate a codec-neutral value into a module's heap (inverse of `convert`). Fail-closed (never a silent
+/// default): a value kind with no live representation in v1 is a typed error.
+fn alloc<'v>(module: &Module<'v>, v: &BzlValue) -> Result<Value<'v>, BzlError> {
     let heap = module.heap();
-    match v {
+    Ok(match v {
         BzlValue::None => heap.alloc(NoneType),
         BzlValue::Bool(b) => Value::new_bool(*b),
         BzlValue::Int(i) => heap.alloc(*i),
         BzlValue::Str(s) => heap.alloc(s.as_str()),
         BzlValue::List(items) => {
-            let vals: Vec<Value> = items.iter().map(|it| alloc(module, it)).collect();
+            let vals: Vec<Value> = items.iter().map(|it| alloc(module, it)).collect::<Result<_, _>>()?;
             heap.alloc(vals)
         }
         // A rule re-materializes as a callable RuleProxy (calling it in a BUILD records a target).
@@ -363,41 +409,85 @@ fn alloc<'v>(module: &Module<'v>, v: &BzlValue) -> Value<'v> {
             toolchains: rd.toolchains.clone(),
         }),
         // A provider re-materializes as a callable Provider (constructs instances; keys dep[Provider] lookups).
-        BzlValue::Provider(pd) => heap.alloc(Provider { id: pd.id.clone(), fields: pd.fields.clone() }),
-    }
+        // The live value carries the exported NAME; a filled bzl dim (a cross-module identity) has no live
+        // representation under the v1 single-module cap — fail closed rather than silently drop the dim.
+        BzlValue::Provider(pd) => {
+            if pd.id.bzl().is_some() {
+                return Err(BzlError::Unsupported {
+                    what: format!(
+                        "provider '{}' with a cross-module identity (bzl dim) under the v1 single-module cap",
+                        pd.id.name()
+                    ),
+                });
+            }
+            heap.alloc(Provider { id: pd.id.name().to_owned(), fields: pd.fields.clone() })
+        }
+        // Depsets are value-model-only in v1 (the digest tag is pinned; the live machinery is not built) —
+        // materializing one is a typed error, never a silent placeholder (P3).
+        BzlValue::Depset(_) => {
+            return Err(BzlError::Unsupported { what: "depset (no live depset values in v1)".to_owned() })
+        }
+    })
 }
 
 /// Allocate a codec-neutral `ProviderInstance` (a dep's already-computed provider) as a live value, so a rule
-/// impl can read it via `dep[Provider].field`.
-fn alloc_provider_instance<'v>(module: &Module<'v>, pi: &ProviderInstance) -> Value<'v> {
-    let fields: Vec<(String, Value<'v>)> =
-        pi.fields.iter().map(|(n, bv)| (n.clone(), alloc(module, bv))).collect();
-    module.heap().alloc(ProviderInstanceValueGen { provider_id: pi.provider.0.clone(), fields })
+/// impl can read it via `dep[Provider].field`. The live value carries the exported NAME — its identity gate is
+/// the CALLER's: the dep path re-keys through `providers_by_id` (ProviderId's derived impls, so a bzl-differing
+/// instance never gets here), and the toolchain path checks the dim before allocating.
+fn alloc_provider_instance<'v>(module: &Module<'v>, pi: &ProviderInstance) -> Result<Value<'v>, BzlError> {
+    let fields: Vec<(String, Value<'v>)> = pi
+        .fields
+        .iter()
+        .map(|(n, bv)| Ok((n.clone(), alloc(module, bv)?)))
+        .collect::<Result<_, BzlError>>()?;
+    Ok(module.heap().alloc(ProviderInstanceValueGen { provider_id: pi.provider.name().to_owned(), fields }))
 }
 
 /// Rebuild a loaded module's bindings into a `FrozenModule` so the `ReturnFileLoader` can serve it.
 fn build_frozen(m: &BzlModule) -> Result<FrozenModule, BzlError> {
     Module::with_temp_heap(|module| -> Result<FrozenModule, BzlError> {
         for (name, v) in &m.bindings {
-            let val = alloc(&module, v);
+            let val = alloc(&module, v)?;
             module.set(name, val);
         }
         module.freeze().map_err(|e| BzlError::Eval { detail: format!("{e:?}") })
     })
 }
 
-// ──────────────── globals ────────────────
-
-/// `.bzl`-dialect globals: standard + `rule()` + the `attr` namespace. (BUILD-dialect globals are separate —
-/// they expose `target()`, not `rule()`/`attr`, mirroring Bazel.)
-fn bzl_globals() -> Globals {
-    GlobalsBuilder::standard()
-        .with(rule_global)
-        .with(provider_global)
-        .with(action_global)
-        .with_namespace("attr", attr_namespace)
-        .build()
+/// Scan a module's bindings for live `Provider` declarations, building the identity index that keys the
+/// per-dep `{Provider: instance}` dicts. FAIL-CLOSED (lockdown decision H): two DISTINCT declarations
+/// sharing one identity are a typed `Eval` error naming the provider — the silent last-wins insert is dead.
+/// Aliasing — two names bound to the SAME declaration value — stays legal (one identity, not a collision).
+fn index_providers<'v>(module: &Module<'v>, module_name: &str) -> Result<HashMap<ProviderId, Value<'v>>, BzlError> {
+    let mut by_id: HashMap<ProviderId, Value<'v>> = HashMap::new();
+    for n in module.names() {
+        if let Some(v) = module.get(n.as_str()) {
+            if let Some(p) = Provider::from_value(v) {
+                let id = p.provider_id();
+                match by_id.get(&id) {
+                    Some(prev) if prev.ptr_eq(v) => {} // an alias of one declaration — legal
+                    Some(_) if cfg!(feature = "mutant_provider_dup_decl_absorbed") => {
+                        // MUTANT: restore the pre-lockdown silent last-wins overwrite.
+                        by_id.insert(id, v);
+                    }
+                    Some(_) => {
+                        return Err(BzlError::Eval {
+                            detail: format!("provider '{}' is declared more than once in {module_name}", id.name()),
+                        })
+                    }
+                    None => {
+                        by_id.insert(id, v);
+                    }
+                }
+            }
+        }
+    }
+    Ok(by_id)
 }
+
+// ──────────────── globals ────────────────
+// The per-phase Globals are NAMED, precomputed and digested in `envs` (lockdown §3) — the ad-hoc
+// rebuilt-per-call `bzl_globals()` is gone. The registrar fns below stay here (they own the builtins).
 
 /// Accumulates the actions a rule's impl declares (via `declare_action`). Installed in `eval.extra` during
 /// `evaluate_rule` so the builtin (a `fn`, can't capture) records into it; collected into the `RuleResult`.
@@ -407,7 +497,7 @@ struct ActionRegistry {
 }
 
 #[starlark_module]
-fn action_global(builder: &mut GlobalsBuilder) {
+pub(crate) fn action_global(builder: &mut GlobalsBuilder) {
     /// `declare_action(mnemonic=, argv=[...], outputs=[...], inputs=[...])` — a rule impl declares an action the
     /// EXECUTION phase will run. SPIKE: a placeholder for `ctx.actions.run(...)` (the object-method form is a
     /// fidelity refinement); records an `ActionTemplate`. Fail-closed: callable only inside a rule impl.
@@ -444,7 +534,7 @@ fn action_global(builder: &mut GlobalsBuilder) {
 }
 
 #[starlark_module]
-fn rule_global(builder: &mut GlobalsBuilder) {
+pub(crate) fn rule_global(builder: &mut GlobalsBuilder) {
     /// `rule(implementation = <fn>, attrs = {name: attr.<type>()}, toolchains = ["//type"])` — define a rule.
     /// Records the attr schema + the required toolchain TYPE ids; validates an implementation is present.
     /// Running the impl (+ resolving the toolchains) is analysis.
@@ -487,7 +577,7 @@ fn rule_global(builder: &mut GlobalsBuilder) {
 }
 
 #[starlark_module]
-fn provider_global(builder: &mut GlobalsBuilder) {
+pub(crate) fn provider_global(builder: &mut GlobalsBuilder) {
     /// `provider(name, fields = [..])` — declare a provider type. SPIKE: identity is the explicit `name`
     /// (so it is stable across the per-target re-evaluations that the analysis phase performs).
     fn provider<'v>(
@@ -513,7 +603,7 @@ fn provider_global(builder: &mut GlobalsBuilder) {
 }
 
 #[starlark_module]
-fn attr_namespace(builder: &mut GlobalsBuilder) {
+pub(crate) fn attr_namespace(builder: &mut GlobalsBuilder) {
     fn int() -> anyhow::Result<AttrTypeValue> {
         Ok(AttrTypeValue { code: AttrType::Int.code() })
     }
@@ -542,7 +632,7 @@ struct TargetRegistry {
 }
 
 #[starlark_module]
-fn build_globals(builder: &mut GlobalsBuilder) {
+pub(crate) fn build_globals(builder: &mut GlobalsBuilder) {
     /// `target(kind = ..., name = ..., **attrs)` — record a target instance with NO rule origin (the spike
     /// placeholder; analysis fails closed on it). The `rule()`-defined callable is the real instantiation path.
     fn target<'v>(
@@ -577,22 +667,38 @@ fn build_globals(builder: &mut GlobalsBuilder) {
 
 impl BzlEvaluator for StarlarkEvaluator {
     fn load_targets(&self, source: &str) -> Result<Vec<String>, BzlError> {
-        let ast = parse("<load-scan>", source)?;
+        // Parse-only load SCAN (dep discovery before any evaluation) — the permissive standard dialect is
+        // deliberate: it must parse both `.bzl` and BUILD sources; the phase dialect gates real evaluation.
+        let ast = parse("<load-scan>", source, &Dialect::Standard)?;
         Ok(ast.loads().into_iter().map(|l| l.module_id.to_owned()).collect())
+    }
+
+    fn predeclared_env_id(&self, kind: &LoadKind, dialect: ApiDialect) -> Result<PredeclaredEnvId, BzlError> {
+        match (kind, dialect) {
+            // BOTH Build{is_prelude:*} kinds SHARE EnvBuildBzl (R1) — the prelude bit is a LoadKind/key
+            // bit, never an environment.
+            (LoadKind::Build { .. }, ApiDialect::Bzl) => Ok(env_build_bzl().env_id),
+            // Rows 3-6 have no built environment in v1 — fail closed, never a defaulted id.
+            _ => Err(BzlError::Unsupported {
+                what: format!("the predeclared environment for {kind:?}/{dialect:?} (not built in v1)"),
+            }),
+        }
     }
 
     fn evaluate(
         &self,
+        env: &EvalEnv,
         module_name: &str,
         source: &str,
         loaded: &[(String, BzlModule)],
     ) -> Result<BzlModule, BzlError> {
-        let ast = parse(module_name, source)?;
+        let phase = select_bzl_env(env)?; // the NAMED row-1 env — fail-closed on any unbuilt row
+        let ast = parse(module_name, source, &phase.dialect)?;
         // load()ed symbols are usable locally but are NOT re-exported (Bazel semantics) — collect their
         // local names so we can exclude them from this module's exports.
         let loaded_names: HashSet<String> =
             ast.loads().iter().flat_map(|l| l.symbols.keys().map(|k| k.to_string())).collect();
-        let globals = bzl_globals(); // standard + rule() + attr namespace
+        let globals = &phase.globals; // EnvBuildBzl: standard + rule()/provider()/declare_action + attr
 
         // Rebuild each load() target as a FrozenModule, then index by target string for the loader.
         let frozen: Vec<(String, FrozenModule)> = loaded
@@ -606,9 +712,12 @@ impl BzlEvaluator for StarlarkEvaluator {
             {
                 let mut eval = Evaluator::new(&module);
                 eval.set_loader(&loader);
-                eval.eval_module(ast, &globals)
+                eval.eval_module(ast, globals)
                     .map_err(|e| BzlError::Eval { detail: e.to_string() })?;
             }
+            // Decision H: a second same-name provider() reaching module scope is fail-closed at declaration
+            // (the index result is unused here — the scan IS the collision check; aliasing stays legal).
+            index_providers(&module, module_name)?;
             let mut bindings = Vec::new();
             for name in module.names() {
                 let n = name.as_str();
@@ -639,10 +748,12 @@ impl BzlEvaluator for StarlarkEvaluator {
         source: &str,
         loaded: &[(String, BzlModule)],
     ) -> Result<Vec<TargetDecl>, BzlError> {
-        let ast = parse(package_name, source)?;
-        // Standard globals + the BUILD-only `target()` builtin. (SPIKE: the Standard dialect also permits
-        // `def`, which strict Bazel BUILD dialect forbids — a refinement, not a correctness gap here.)
-        let globals = GlobalsBuilder::standard().with(build_globals).build();
+        // Row 7, `EnvBuildFile`: the NAMED BUILD-file env (standard + the BUILD-only `target()` builtin)
+        // under the def-less BUILD dialect — `def`/`lambda` in a BUILD now fail at PARSE (the spike's
+        // admitted permissive-dialect gap is closed; separation is environmental, not runtime-only).
+        let phase = env_build_file();
+        let ast = parse(package_name, source, &phase.dialect)?;
+        let globals = &phase.globals;
 
         // Rebuild each load() target as a FrozenModule, then index by target string for the loader — same
         // mechanism as `evaluate`; the BUILD's `load()`ed constants AND rule callables resolve through this.
@@ -659,7 +770,7 @@ impl BzlEvaluator for StarlarkEvaluator {
                 let mut eval = Evaluator::new(&module);
                 eval.set_loader(&loader);
                 eval.extra = Some(&registry); // target() and rule-callables record into this
-                eval.eval_module(ast, &globals)
+                eval.eval_module(ast, globals)
                     .map_err(|e| BzlError::Eval { detail: e.to_string() })?;
             }
             Ok(registry.targets.borrow().clone())
@@ -668,6 +779,7 @@ impl BzlEvaluator for StarlarkEvaluator {
 
     fn evaluate_rule(
         &self,
+        env: &EvalEnv,
         rule_source: &str,
         rule_module_name: &str,
         rule_name: &str,
@@ -677,8 +789,9 @@ impl BzlEvaluator for StarlarkEvaluator {
         deps: &[DepProviders],
         toolchains: &[ResolvedToolchain],
     ) -> Result<RuleResult, BzlError> {
-        let ast = parse(rule_module_name, rule_source)?;
-        let globals = bzl_globals(); // standard + rule + provider + attr
+        let phase = select_bzl_env(env)?; // the SAME row-1 env the module was loaded in
+        let ast = parse(rule_module_name, rule_source, &phase.dialect)?;
+        let globals = &phase.globals;
 
         let frozen: Vec<(String, FrozenModule)> = loaded
             .iter()
@@ -693,7 +806,7 @@ impl BzlEvaluator for StarlarkEvaluator {
             eval.set_loader(&loader);
             eval.extra = Some(&action_registry); // declare_action (during the impl run below) records into this
             // Define the rule, its impl, and any providers (the impl is NOT run yet — it's just a function).
-            eval.eval_module(ast, &globals).map_err(|e| BzlError::Eval { detail: e.to_string() })?;
+            eval.eval_module(ast, globals).map_err(|e| BzlError::Eval { detail: e.to_string() })?;
 
             // The rule + its live implementation function (live in THIS heap — no cross-heap frozen value).
             let rule_v = module
@@ -704,16 +817,10 @@ impl BzlEvaluator for StarlarkEvaluator {
             let impl_fn = rule.implementation.to_value();
             let schema = decode_schema(&rule.attrs)?;
 
-            // Index this eval's live Provider values by id — these key the per-dep `{Provider: instance}` dicts,
-            // matching a dep's (codec-neutral) provider id back to THIS eval's provider object.
-            let mut providers_by_id: HashMap<String, Value> = HashMap::new();
-            for n in module.names() {
-                if let Some(v) = module.get(n.as_str()) {
-                    if let Some(p) = Provider::from_value(v) {
-                        providers_by_id.insert(p.id.clone(), v);
-                    }
-                }
-            }
+            // Index this eval's live Provider values by identity — these key the per-dep `{Provider: instance}`
+            // dicts, matching a dep's (codec-neutral) provider id back to THIS eval's provider object.
+            // Fail-closed on a duplicate declaration (decision H — the silent last-wins is dead).
+            let providers_by_id = index_providers(&module, rule_module_name)?;
 
             // Build ctx.attr: scalars alloc directly; label-typed attrs become a list of `{Provider: instance}`
             // dicts (one per dep), so the impl can do `for d in ctx.attr.deps: d[Provider].field`.
@@ -750,17 +857,30 @@ impl BzlEvaluator for StarlarkEvaluator {
                         };
                         let mut entries: Vec<(Value, Value)> = Vec::new();
                         for pi in providers {
-                            let key = providers_by_id.get(&pi.provider.0).copied().ok_or_else(|| BzlError::Eval {
-                                detail: format!("provider '{}' (on dep {lbl}) is not defined in this rule's .bzl", pi.provider.0),
+                            // dep[Provider] re-keying rides ProviderId's derived impls (the C2 funnel): a
+                            // same-name identity differing in the bzl dim is a DIFFERENT provider — miss,
+                            // fail closed — never fused by raw name.
+                            let key = if cfg!(feature = "mutant_provider_compares_raw_name") {
+                                // MUTANT: compare the raw name only — the §0.3 leak; a bzl-differing
+                                // identity silently fuses with this module's provider.
+                                providers_by_id.iter().find(|(k, _)| k.name() == pi.provider.name()).map(|(_, v)| *v)
+                            } else {
+                                providers_by_id.get(&pi.provider).copied()
+                            };
+                            let key = key.ok_or_else(|| BzlError::Eval {
+                                detail: format!(
+                                    "provider '{}' (on dep {lbl}) is not defined in this rule's .bzl",
+                                    pi.provider.name()
+                                ),
                             })?;
-                            entries.push((key, alloc_provider_instance(&module, pi)));
+                            entries.push((key, alloc_provider_instance(&module, pi)?));
                         }
                         dep_vals.push(heap.alloc(AllocDict(entries)));
                     }
                     attr_fields.push((aname.clone(), heap.alloc(dep_vals)));
                 } else {
                     let v = match aval {
-                        Some(bv) => alloc(&module, bv),
+                        Some(bv) => alloc(&module, bv)?,
                         None => Value::new_none(),
                     };
                     attr_fields.push((aname.clone(), v));
@@ -769,10 +889,21 @@ impl BzlEvaluator for StarlarkEvaluator {
             let attr_struct = heap.alloc(AllocStruct(attr_fields));
             // ctx.toolchains: a map {toolchain_type -> toolchain_info} (empty until phase #4 supplies resolved
             // toolchains). A missing type indexes to a fail-closed error (native dict KeyError).
-            let tc_entries: Vec<(Value, Value)> = toolchains
-                .iter()
-                .map(|t| (heap.alloc(t.toolchain_type.as_str()), alloc_provider_instance(&module, &t.info)))
-                .collect();
+            let mut tc_entries: Vec<(Value, Value)> = Vec::new();
+            for t in toolchains {
+                // This path bypasses the providers_by_id re-keying (a toolchain_info is injected, not looked
+                // up), so the cross-module-identity wall is checked HERE: a filled bzl dim has no live
+                // representation under the v1 single-module cap — fail closed, never silently drop the dim.
+                if t.info.provider.bzl().is_some() {
+                    return Err(BzlError::Unsupported {
+                        what: format!(
+                            "toolchain_info provider '{}' with a cross-module identity (bzl dim) under the v1 single-module cap",
+                            t.info.provider.name()
+                        ),
+                    });
+                }
+                tc_entries.push((heap.alloc(t.toolchain_type.as_str()), alloc_provider_instance(&module, &t.info)?));
+            }
             let toolchains_dict = heap.alloc(AllocDict(tc_entries));
             let ctx = heap.alloc(AllocStruct([
                 ("label".to_string(), heap.alloc(label)),
@@ -794,10 +925,36 @@ impl BzlEvaluator for StarlarkEvaluator {
                 for (n, v) in &piv.fields {
                     fields.push((n.clone(), convert(v.to_value())?));
                 }
-                out.push(ProviderInstance { provider: ProviderId(piv.provider_id.clone()), fields });
+                out.push(ProviderInstance { provider: ProviderId::from_name(piv.provider_id.clone()), fields });
             }
-            // Canonical order (providers are a by-type set) so the node value is deterministic → A4 early cutoff.
-            out.sort_by(|a, b| a.provider.0.cmp(&b.provider.0));
+            // Decision E: a duplicate provider key on the rule's RETURN is fail-closed with Bazel's exact
+            // error shape (StarlarkRuleConfiguredTargetUtil.java:273-275) — checked over the insertion-ordered
+            // result at the boundary, BEFORE the canonical sort. Never a silent last-wins.
+            if cfg!(feature = "mutant_rule_result_merges_dup_provider") {
+                // MUTANT: restore silent last-wins — a later instance replaces the earlier one.
+                let mut merged: Vec<ProviderInstance> = Vec::new();
+                for pi in out {
+                    match merged.iter_mut().find(|e| e.provider == pi.provider) {
+                        Some(slot) => *slot = pi,
+                        None => merged.push(pi),
+                    }
+                }
+                out = merged;
+            } else {
+                for i in 0..out.len() {
+                    if out[..i].iter().any(|e| e.provider == out[i].provider) {
+                        return Err(BzlError::Eval {
+                            detail: format!(
+                                "Multiple conflicting returned providers with key {}",
+                                out[i].provider.name()
+                            ),
+                        });
+                    }
+                }
+            }
+            // Canonical order (providers are a by-type set, sorted by ProviderId's derived Ord) so the node
+            // value is deterministic → A4 early cutoff.
+            out.sort_by(|a, b| a.provider.cmp(&b.provider));
             // actions stay empty until phase #5 wires ctx.actions; the RuleResult shape is reserved now.
             // MUTANT: drop the declared actions → they never reach the execution phase (emission test red).
             let actions = if cfg!(feature = "mutant_rule_eval_drops_actions") {
@@ -848,5 +1005,128 @@ mod tests {
         conformance::provider_rejects_unknown_field(&StarlarkEvaluator::new());
         conformance::rule_eval_missing_dep_label_is_fail_closed(&StarlarkEvaluator::new());
         conformance::supports_action_declaration(&StarlarkEvaluator::new());
+    }
+
+    /// The provider-identity lockdown gates (ADR-0004 / RazelV4ProviderIdentityLockdown §4): opaque identity
+    /// comparison (C2), fail-closed duplicate declaration (H), fail-closed duplicate return (E).
+    #[test]
+    fn passes_provider_identity_conformance() {
+        conformance::provider_identity_opaque_comparison(&StarlarkEvaluator::new());
+        conformance::provider_dup_declaration_fail_closed(&StarlarkEvaluator::new());
+        conformance::rule_result_dup_provider_fail_closed(&StarlarkEvaluator::new());
+    }
+
+    // ──────────────── phase-environment lockdown gates (ADR-0003 §4) ────────────────
+
+    /// Gate `build_loaded_and_build_file_not_conflated` (the v1 cut of
+    /// `build_loaded_and_bzlmod_loaded_not_conflated`): the two phases that exist today are distinct BOTH
+    /// by env identity and by name-set. RED under `mutant_one_globals_all_loadkinds` (the spike's one
+    /// bzl_globals() served for every phase).
+    #[test]
+    fn one_globals_per_phase_not_conflated() {
+        conformance::phase_envs_not_conflated(&StarlarkEvaluator::new());
+        assert_ne!(
+            crate::envs::env_build_bzl().env_id,
+            crate::envs::env_build_file().env_id,
+            "EnvBuildBzl and EnvBuildFile must have distinct PredeclaredEnvIds (phase separation is keyed)"
+        );
+    }
+
+    /// Gate `predeclared_env_id_is_canonical` (§4, NEW — the impl side): the SERVED ids equal the api's
+    /// canonical derivation from the DECLARED registry tables, are deterministic across evaluators, and
+    /// the prelude kind SHARES EnvBuildBzl (R1). RED under `mutant_env_digest_from_heap_iteration` (the
+    /// id derived from live `Globals` name enumeration — heap/seam bytes — instead of the registry).
+    #[test]
+    fn predeclared_env_id_is_canonical() {
+        use razel_bzl_api::{derive_predeclared_env_id, EnvTag};
+        let e = StarlarkEvaluator::new();
+        let build_bzl = e
+            .predeclared_env_id(&LoadKind::Build { is_prelude: false }, ApiDialect::Bzl)
+            .expect("the row-1 env id is served");
+        assert_eq!(
+            build_bzl,
+            derive_predeclared_env_id(EnvTag::EnvBuildBzl, &crate::envs::entries(crate::envs::ENV_BUILD_BZL_TABLE), None),
+            "the served id must be the canonical derivation of the DECLARED registry — never heap bytes"
+        );
+        assert_eq!(
+            crate::envs::env_build_file().env_id,
+            derive_predeclared_env_id(EnvTag::EnvBuildFile, &crate::envs::entries(crate::envs::ENV_BUILD_FILE_TABLE), None),
+            "the BUILD-file env id must be the canonical derivation of its declared registry"
+        );
+        assert_eq!(
+            e.predeclared_env_id(&LoadKind::Build { is_prelude: true }, ApiDialect::Bzl).unwrap(),
+            build_bzl,
+            "Build{{is_prelude:true}} SHARES EnvBuildBzl (R1) — prelude-ness is a key bit, not an env"
+        );
+        assert_eq!(
+            StarlarkEvaluator::new().predeclared_env_id(&LoadKind::Build { is_prelude: false }, ApiDialect::Bzl).unwrap(),
+            build_bzl,
+            "deterministic across evaluator instances"
+        );
+        // Rows v1 has not built fail closed — never a defaulted id.
+        assert!(e.predeclared_env_id(&LoadKind::Bzlmod, ApiDialect::Bzl).is_err());
+        assert!(e.predeclared_env_id(&LoadKind::Builtins, ApiDialect::Bzl).is_err());
+        assert!(e.predeclared_env_id(&LoadKind::Build { is_prelude: false }, ApiDialect::Scl).is_err());
+    }
+
+    /// The per-phase Dialect consts (§3): the BUILD dialect forbids `def` at PARSE (Bazel's BUILD
+    /// dialect), closing the spike's permissive-dialect gap; `.bzl` keeps the standard set.
+    #[test]
+    fn build_dialect_forbids_def_at_parse() {
+        assert!(
+            matches!(
+                StarlarkEvaluator::new().evaluate_build("pkg", "def f():\n    pass\n", &[]),
+                Err(BzlError::Parse { .. })
+            ),
+            "a def in a BUILD file must be a PARSE error under the BUILD dialect (environmental, not runtime)"
+        );
+        assert!(
+            StarlarkEvaluator::new()
+                .evaluate(&EvalEnv::default(), "m.bzl", "def _f():\n    return 1\nx = _f()\n", &[])
+                .is_ok(),
+            ".bzl keeps the standard dialect (def is legal)"
+        );
+    }
+
+    /// Fail-closed row selection (§3): environments v1 has not built are typed errors at the seam —
+    /// an unknown semantics row, non-default TypeOptions, prelude, `.scl`, and the bzlmod kinds.
+    #[test]
+    fn unbuilt_env_rows_fail_closed() {
+        let e = StarlarkEvaluator::new();
+        let src = "x = 1\n";
+        let with = |f: &dyn Fn(&mut EvalEnv)| {
+            let mut env = EvalEnv::default();
+            f(&mut env);
+            e.evaluate(&env, "m.bzl", src, &[])
+        };
+        assert!(with(&|_| {}).is_ok(), "the row-1 v1 env evaluates");
+        assert!(
+            matches!(with(&|env| env.semantics = StarlarkSemanticsId([9; 32])), Err(BzlError::Unsupported { .. })),
+            "an unknown semantics row must fail closed (keyed selection with one v1 entry)"
+        );
+        assert!(
+            matches!(
+                with(&|env| env.type_options = TypeOptions { use_type_syntax: true, ..Default::default() }),
+                Err(BzlError::Unsupported { .. })
+            ),
+            "non-default TypeOptions must fail closed until the load-time type-check pass exists"
+        );
+        assert!(
+            matches!(
+                with(&|env| env.load_kind = LoadKind::Build { is_prelude: true }),
+                Err(BzlError::Unsupported { .. })
+            ),
+            "prelude evaluation (re-export) is not built — fail closed"
+        );
+        assert!(
+            matches!(with(&|env| env.dialect = ApiDialect::Scl), Err(BzlError::Unsupported { .. })),
+            ".scl is semantics-disabled in v1 — fail closed"
+        );
+        for kind in [LoadKind::Builtins, LoadKind::Bzlmod, LoadKind::BzlmodBootstrap] {
+            assert!(
+                matches!(with(&|env| env.load_kind = kind), Err(BzlError::Unsupported { .. })),
+                "{kind:?} has no built environment in v1 — fail closed"
+            );
+        }
     }
 }

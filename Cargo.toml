@@ -30,3 +30,20 @@ mutant_provider_skips_field_validation = []
 mutant_rule_eval_absorbs_missing_dep = []
 # RED-FIRST: drop a rule's declared actions → they never reach execution (action-declaration test red).
 mutant_rule_eval_drops_actions = []
+# RED-FIRST: dep[Provider] re-keying compares the raw NAME instead of the full ProviderId → a bzl-differing
+# identity silently fuses with this module's provider (opaque-comparison conformance red).
+mutant_provider_compares_raw_name = []
+# RED-FIRST: restore the silent last-wins overwrite for a duplicate same-name provider() declaration
+# (dup-declaration conformance red).
+mutant_provider_dup_decl_absorbed = []
+# RED-FIRST: a rule impl returning two instances of one provider silently merges last-wins instead of
+# failing closed with Bazel's error shape (dup-return conformance red).
+mutant_rule_result_merges_dup_provider = []
+# RED-FIRST (phase-env lockdown §4): collapse the per-phase environments back to the spike's ONE Globals
+# served for every phase (one id, one permissive dialect) → one_globals_per_phase_not_conflated (+ the
+# phase-separation conformance) must go red.
+mutant_one_globals_all_loadkinds = []
+# RED-FIRST (phase-env lockdown §4, R1): derive the PredeclaredEnvId from live starlark `Globals` name
+# enumeration (heap/seam bytes) instead of the declared razel registry → predeclared_env_id_is_canonical
+# must go red.
+mutant_env_digest_from_heap_iteration = []
