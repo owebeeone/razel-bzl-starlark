@@ -33,6 +33,7 @@ pub(crate) const ENV_BUILD_BZL_TABLE: &[(&str, &str, &str)] = &[
     ("declare_action", "razel.declare_action", "1"),
     ("provider", "razel.provider", "1"),
     ("rule", "razel.rule", "1"),
+    ("write_file", "razel.write_file", "1"),
 ];
 
 /// The DECLARED registry of `EnvBuildFile` (row 7): the BUILD-file toplevels.

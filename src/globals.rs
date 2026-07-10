@@ -57,6 +57,36 @@ pub(crate) fn action_global(builder: &mut GlobalsBuilder) {
         reg.actions.borrow_mut().push(ActionTemplate { mnemonic, argv, env: Vec::new(), inputs, outputs });
         Ok(NoneType)
     }
+
+    /// `write_file(output=, content=)` — a rule impl declares a no-subprocess content-write action (Bazel's
+    /// `ctx.actions.write` / `FileWriteAction`). It records an `ActionTemplate` whose content rides in the
+    /// FROZEN `argv` dimension by the shared convention `mnemonic="WriteFile"`, `argv=["write_file", content]`
+    /// — so the declared content is part of the action's 8-dim fingerprint with NO new fingerprint dimension,
+    /// and `razel-exec-api`'s `WriteStrategy` (which owns the matching convention) emits the output from that
+    /// argv. Content is thus real action DATA end-to-end (edit → re-run, identical → early-cut). Fail-closed:
+    /// callable only inside a rule impl; `content` must be a string (v1: UTF-8 content only — a bytes channel
+    /// is a later additive refinement).
+    fn write_file<'v>(
+        #[starlark(require = named)] output: String,
+        #[starlark(require = named)] content: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let reg = eval
+            .extra
+            .and_then(|e| e.downcast_ref::<ActionRegistry>())
+            .ok_or_else(|| anyhow::anyhow!("write_file can only be called inside a rule implementation"))?;
+        reg.actions.borrow_mut().push(ActionTemplate {
+            // The shared write-action convention (mirrored, by value, in razel-exec-api::conformance —
+            // WRITE_FILE_MNEMONIC / WRITE_FILE_ARGV0 / write_file_argv). Kept in lockstep the same way the
+            // fingerprint and the SpawnRequest both read `argv` independently: one convention, two readers.
+            mnemonic: "WriteFile".to_string(),
+            argv: vec!["write_file".to_string(), content],
+            env: Vec::new(),
+            inputs: Vec::new(),
+            outputs: vec![output],
+        });
+        Ok(NoneType)
+    }
 }
 
 #[starlark_module]
