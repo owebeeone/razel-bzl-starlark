@@ -212,7 +212,15 @@ impl BzlEvaluator for StarlarkEvaluator {
             // Index this eval's live Provider values by identity — these key the per-dep `{Provider: instance}`
             // dicts, matching a dep's (codec-neutral) provider id back to THIS eval's provider object.
             // Fail-closed on a duplicate declaration (decision H — the silent last-wins is dead).
-            let providers_by_id = index_providers(&module, rule_module_name)?;
+            let mut providers_by_id = index_providers(&module, rule_module_name)?;
+            // Builtin providers (row-G `DefaultInfo`) are GLOBALS, not module bindings, so `index_providers`
+            // (which scans module names) never sees them. Register the `DefaultInfo` identity so a
+            // `dep[DefaultInfo]` in the impl re-keys through it (the key is a fresh Provider with the SAME
+            // ProviderId — dict lookup rides ProviderId's derived Eq/Hash, so it matches the global the impl
+            // references). A `.bzl` that also declares `DefaultInfo` keeps its own (`or_insert`).
+            providers_by_id
+                .entry(ProviderId::from_name(crate::globals::DEFAULT_INFO_NAME))
+                .or_insert_with(|| module.heap().alloc(crate::globals::default_info_provider()));
 
             // Build ctx.attr: scalars alloc directly; label-typed attrs become a list of `{Provider: instance}`
             // dicts (one per dep), so the impl can do `for d in ctx.attr.deps: d[Provider].field`.

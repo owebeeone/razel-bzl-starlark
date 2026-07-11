@@ -41,6 +41,45 @@ mod tests {
         conformance::supports_action_declaration(&StarlarkEvaluator::new());
     }
 
+    /// Row-G first slice: the builtin `DefaultInfo` is (1) constructible from a rule impl
+    /// (`DefaultInfo(files=[...])` — a global, no declaration) and (2) readable across a dep edge via
+    /// `dep[DefaultInfo].files` (the re-keying registers the builtin identity in `providers_by_id`). This is
+    /// the files-chaining carrier: a dep's DefaultInfo files reach a dependent rule's impl.
+    #[test]
+    fn default_info_builtin_constructible_and_readable() {
+        use razel_bzl_api::{BzlValue, DepProviders, ProviderId, ProviderInstance};
+        let e = StarlarkEvaluator::new();
+        let src = "\
+Out = provider(\"Out\", fields = [\"paths\"])\n\
+def _impl(ctx):\n\
+\x20   files = []\n\
+\x20   for d in ctx.attr.deps:\n\
+\x20       files = files + d[DefaultInfo].files\n\
+\x20   return [DefaultInfo(files = [\"self.o\"]), Out(paths = files)]\n\
+my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})\n";
+        let dep = DepProviders {
+            label: ":dep".into(),
+            providers: vec![ProviderInstance {
+                provider: ProviderId::from_name("DefaultInfo"),
+                fields: vec![("files".into(), BzlValue::List(vec![BzlValue::Str("dep.rlib".into())]))],
+            }],
+        };
+        let attrs = vec![("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":dep".into())]))];
+        let result = e
+            .evaluate_rule(&EvalEnv::default(), src, "m.bzl", "my_rule", &[], "//p:t", &attrs, &[dep], &[])
+            .expect("the rule evaluates (DefaultInfo builtin is available + dep[DefaultInfo] re-keys)");
+        let out = result.providers.iter().find(|p| p.provider.name() == "Out").expect("Out provider present");
+        assert_eq!(
+            out.get("paths"),
+            Some(&BzlValue::List(vec![BzlValue::Str("dep.rlib".into())])),
+            "the impl read the dep's DefaultInfo.files via dep[DefaultInfo] (the builtin re-keys, no declaration)"
+        );
+        assert!(
+            result.providers.iter().any(|p| p.provider.name() == "DefaultInfo"),
+            "DefaultInfo(files=[...]) is constructible from the impl (the global builtin) and returned"
+        );
+    }
+
     /// The provider-identity lockdown gates (ADR-0004 / RazelV4ProviderIdentityLockdown §4): opaque identity
     /// comparison (C2), fail-closed duplicate declaration (H), fail-closed duplicate return (E).
     #[test]

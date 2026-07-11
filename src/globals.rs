@@ -24,14 +24,18 @@ pub(crate) struct ActionRegistry {
 
 #[starlark_module]
 pub(crate) fn action_global(builder: &mut GlobalsBuilder) {
-    /// `declare_action(mnemonic=, argv=[...], outputs=[...], inputs=[...])` — a rule impl declares an action the
-    /// EXECUTION phase will run. SPIKE: a placeholder for `ctx.actions.run(...)` (the object-method form is a
-    /// fidelity refinement); records an `ActionTemplate`. Fail-closed: callable only inside a rule impl.
+    /// `declare_action(mnemonic=, argv=[...], outputs=[...], inputs=[...], env={...})` — a rule impl declares
+    /// an action the EXECUTION phase will run. SPIKE: a placeholder for `ctx.actions.run(...)` (the
+    /// object-method form is a fidelity refinement); records an `ActionTemplate`. Fail-closed: callable only
+    /// inside a rule impl. `env` (v2, additive) is the DECLARED env map — the ONE env source (REQ-PATHENV-008:
+    /// it enters the 8-dim fingerprint AND is fed verbatim to the spawn; no host inheritance — a toolchain
+    /// action that needs `PATH` declares it as data, e.g. rustc's linker discovery).
     fn declare_action<'v>(
         #[starlark(require = named)] mnemonic: String,
         #[starlark(require = named)] argv: Value<'v>,
         #[starlark(require = named)] outputs: Value<'v>,
         #[starlark(require = named)] inputs: Option<Value<'v>>,
+        #[starlark(require = named)] env: Option<DictRef<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let reg = eval
@@ -54,7 +58,17 @@ pub(crate) fn action_global(builder: &mut GlobalsBuilder) {
         };
         inputs.sort();
         inputs.dedup();
-        reg.actions.borrow_mut().push(ActionTemplate { mnemonic, argv, env: Vec::new(), inputs, outputs });
+        // env: {name: value} strings only, name-sorted (deterministic — order-insensitive declaration).
+        let mut env_pairs: Vec<(String, String)> = Vec::new();
+        if let Some(d) = env {
+            for (k, v) in d.iter() {
+                let name = k.unpack_str().ok_or_else(|| anyhow::anyhow!("env names must be strings"))?;
+                let val = v.unpack_str().ok_or_else(|| anyhow::anyhow!("env values must be strings"))?;
+                env_pairs.push((name.to_owned(), val.to_owned()));
+            }
+            env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        reg.actions.borrow_mut().push(ActionTemplate { mnemonic, argv, env: env_pairs, inputs, outputs });
         Ok(NoneType)
     }
 
@@ -130,6 +144,21 @@ pub(crate) fn rule_global(builder: &mut GlobalsBuilder) {
         required.dedup();
         Ok(RuleValueGen { implementation, attrs: schema, toolchains: required })
     }
+}
+
+/// The well-known builtin `DefaultInfo` provider NAME (the `RazelV4ProviderIdentityLockdown.md` row-G first
+/// slice). v1 cut: a well-known NAMED provider under the single-module cap — the reserved builtin NAMESPACE
+/// byte (0x01) that partitions builtins from Starlark `FooInfo`s is a later additive step (this v1 identity
+/// is namespace 0x00 `DefaultInfo`, `bzl = None`). Referenced by the env registration (a global) AND by
+/// `evaluate_rule`'s `dep[Provider]` re-keying (`providers_by_id`) so both agree on one identity.
+pub(crate) const DEFAULT_INFO_NAME: &str = "DefaultInfo";
+
+/// The v1 `DefaultInfo` builtin (row-G minimal shape): a single `files` field carrying a target's default
+/// outputs. Constructible from a rule impl (`DefaultInfo(files=[...])`) and readable via `dep[DefaultInfo]`.
+/// Its `files` entries are exec-relative output paths; a dependent rule lists them as action inputs and the
+/// InputResolver maps each to its producing action via the owner CT's chaining map (files-chaining).
+pub(crate) fn default_info_provider() -> Provider {
+    Provider { id: DEFAULT_INFO_NAME.to_owned(), fields: vec!["files".to_owned()] }
 }
 
 #[starlark_module]

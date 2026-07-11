@@ -11,7 +11,10 @@
 //! `attr`/`declare_action`, and the `.bzl` env does not contain `target`. The `eval.extra` registry
 //! fail-closes stay as belt-and-braces, no longer the only wall.
 
-use crate::globals::{action_global, attr_namespace, build_globals, provider_global, rule_global};
+use crate::globals::{
+    action_global, attr_namespace, build_globals, default_info_provider, provider_global, rule_global,
+    DEFAULT_INFO_NAME,
+};
 use razel_bzl_api::{derive_predeclared_env_id, EnvEntry, EnvTag, PredeclaredEnvId};
 use starlark::environment::{Globals, GlobalsBuilder};
 use starlark::syntax::Dialect;
@@ -29,8 +32,11 @@ pub(crate) struct PhaseEnv {
 /// excluded per the §1 matrix (all rows exclude it). Editing a builtin's observable behavior BUMPS its
 /// version here — that is what re-fingerprints the env (R1), not a heap iteration.
 pub(crate) const ENV_BUILD_BZL_TABLE: &[(&str, &str, &str)] = &[
+    ("DefaultInfo", "razel.DefaultInfo", "1"),
     ("attr", "razel.attr", "1"),
-    ("declare_action", "razel.declare_action", "1"),
+    // v2: the additive `env=` param (the declared env map — REQ-PATHENV-008's one source) — an observable
+    // behavior change, so the version bumps and the env id re-fingerprints (no goldens pin the v1 id).
+    ("declare_action", "razel.declare_action", "2"),
     ("provider", "razel.provider", "1"),
     ("rule", "razel.rule", "1"),
     ("write_file", "razel.write_file", "1"),
@@ -89,6 +95,7 @@ pub(crate) fn env_build_bzl() -> &'static PhaseEnv {
             .with(rule_global)
             .with(provider_global)
             .with(action_global)
+            .with(|b: &mut GlobalsBuilder| b.set(DEFAULT_INFO_NAME, default_info_provider()))
             .with_namespace("attr", attr_namespace)
             .build();
         make_env(EnvTag::EnvBuildBzl, ENV_BUILD_BZL_TABLE, globals, bzl_dialect())
@@ -117,6 +124,7 @@ fn shared_env() -> &'static PhaseEnv {
             .with(rule_global)
             .with(provider_global)
             .with(action_global)
+            .with(|b: &mut GlobalsBuilder| b.set(DEFAULT_INFO_NAME, default_info_provider()))
             .with(build_globals)
             .with_namespace("attr", attr_namespace)
             .build();
