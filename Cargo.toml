@@ -47,3 +47,44 @@ mutant_one_globals_all_loadkinds = []
 # enumeration (heap/seam bytes) instead of the declared razel registry → predeclared_env_id_is_canonical
 # must go red.
 mutant_env_digest_from_heap_iteration = []
+# RED-FIRST (C2): depset.to_list() drops the transitive recursion → only direct elements surface, so a
+# transitive rlib's -L/--extern contribution vanishes and the multi-crate chain breaks.
+mutant_depset_tolist_drops_transitive = []
+# RED-FIRST (C3): ctx.actions.declare_file ignores the package exec dir → the File lands at the bare name,
+# not <pkg>/<name>, so staging/emit paths (and action identity) are wrong.
+mutant_declare_file_ignores_package = []
+# RED-FIRST (C4): ctx.actions.run drops the flattened arguments → argv is just the executable, so the spawn
+# argv is incomplete (rustc/cc invoked with no flags).
+mutant_ctx_actions_run_drops_arguments = []
+# RED-FIRST (C5): a label_list(providers=[P]) requirement is NOT enforced → a dep missing the required
+# provider silently resolves instead of failing closed (Bazel's providers= check).
+mutant_provider_requirement_unenforced = []
+# RED-FIRST (C5): a mandatory=True attr requirement is NOT enforced → a target omitting it silently analyzes.
+mutant_rule_skips_mandatory = []
+# RED-FIRST (C5): a File carried in a provider field projects to a bare Str (codec drop) → the consuming
+# side's dep[RustInfo].rlib.path loses the .path field and the multi-crate chain fails closed.
+mutant_provider_file_field_stringified = []
+# RED-FIRST (P1b): a SET string_list attr resolves EMPTY → per-crate `crate_features` vanish, so the
+# `--cfg feature="…"` args never reach rustc and a `#[cfg(feature)]`-gated fn is not compiled (the dependent
+# fails closed). Drives the crate_features real-rustc proof RED.
+mutant_string_list_attr_dropped = []
+# RED-FIRST (P1b): an `attr.string(default=…)` value is ignored at analysis → e.g. `edition` collapses to ""
+# → `--edition=` reaches rustc with no value and is rejected (the target fails closed). Drives the
+# edition-default proof RED.
+mutant_attr_string_default_ignored = []
+# RED-FIRST (T20 R-load-codec, live-module bridge): the frozen-module cache ignores the defining_digest —
+# it keys by module PATH only and refuses to refresh on a content change → after a defining module is edited,
+# a dependent that CALLS its function sees the STALE behavior (module-content cutoff broken). Drives the
+# re-evaluation gate (loaded_function_reeval_sees_new_body) RED.
+mutant_live_module_cache_ignores_digest = []
+# RED-FIRST (T20 row 6, Target model): `target.files` is returned as a FLAT LIST instead of a depset[File]
+# (the row-6 law). A consumer that flattens it (`t.files.to_list()`) or re-nests it
+# (`depset(transitive=[t.files])`) then fails closed. Drives `target_files_is_a_depset` RED.
+mutant_target_files_not_depset = []
+# RED-FIRST (T20 row 8, Args full): `map_each` is SKIPPED — the per-item callable is not applied, so items
+# pass through verbatim (or drop) and the projected argv is wrong. Drives `args_map_each_applies_callable` RED.
+mutant_args_map_each_skipped = []
+# RED-FIRST (T20 row 9, ctx scalars): `ctx.expand_location`/`expand_make_variables` ABSORB an unknown
+# `$(...)` form (pass it through verbatim) instead of failing closed on the unsupported directive. Drives
+# `expand_location_fails_closed_on_unknown` RED.
+mutant_expand_location_absorbs_unknown = []

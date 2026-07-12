@@ -1,0 +1,40 @@
+# razel-bzl-starlark/BUILD.bazel — razel building its OWN Starlark-engine binding (part of razel-daemon's fat
+# closure). THE crate that anchors the whole ~150-crate vendored third-party closure: its only non-first-party
+# deps are `starlark`, `anyhow`, `allocative` (via the //crates hub aliases), and starlark's
+# transitive graph is the bulk of the fat binary. Exercises the T19-P3 re-exported-proc-macro `-L`
+# propagation: this crate's `#[derive(Allocative)]` / `#[derive(Trace/Coerce/…)]` / `NoSerialize` /
+# `ProvidesStaticType` / `StarlarkPagable` all come THROUGH `allocative` + `starlark` (their re-exported
+# derives), so rustc needs allocative_derive/starlark_derive/pagable_derive dylib dirs on `-L` —
+# RustInfo.transitive_proc_macros carries them. Multi-file; `tests.rs` is #[cfg(test)] (staged, not in the rlib).
+load("//rules/rust:rust.bzl", "rust_library")
+
+rust_library(
+    name = "razel_bzl_starlark",
+    srcs = [
+        "src/lib.rs",  # crate root (listed first)
+        "src/actions.rs",
+        "src/bridge.rs",
+        "src/convert.rs",
+        "src/envs.rs",
+        "src/eval.rs",
+        "src/globals.rs",
+        "src/globals_def.rs",
+        "src/module_file.rs",
+        "src/tests.rs",
+        "src/values.rs",
+        "src/values_args.rs",
+        "src/values_ctx.rs",
+        "src/values_depset.rs",
+        "src/values_file.rs",
+        "src/values_function.rs",
+        "src/values_label.rs",
+        "src/values_target.rs",
+    ],
+    deps = [
+        "//razel-bzl-api:razel_bzl_api",
+        "//crates:starlark",
+        "//crates:anyhow",
+        "//crates:allocative",
+    ],
+    visibility = ["//visibility:public"],  # consumed cross-package (host — the composition root)
+)
